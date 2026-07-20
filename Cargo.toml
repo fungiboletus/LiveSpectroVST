@@ -20,7 +20,6 @@ egui = { version = "0.35.0", features = ["default_fonts"] }
 nice-plug = { version = "=0.1.9", features = ["assert_process_allocs"] }
 nice-plug-egui = { path = "vendor/nice-plug-egui" }
 realfft = "3.5.0"
-triple_buffer = "9.0.0"
 
 [patch.crates-io]
 baseview = { path = "vendor/baseview" }
