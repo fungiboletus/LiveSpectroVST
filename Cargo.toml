@@ -23,6 +23,7 @@ realfft = "3.5.0"
 
 [patch.crates-io]
 baseview = { path = "vendor/baseview" }
+nice-plug = { path = "vendor/nice-plug" }
 
 [profile.release]
 codegen-units = 1

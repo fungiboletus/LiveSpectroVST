@@ -5,7 +5,7 @@ use nice_plug::prelude::*;
 use nice_plug_egui::{EguiState, create_egui_editor};
 use realfft::num_complex::Complex32;
 use realfft::{RealFftPlanner, RealToComplex};
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Instant;
@@ -60,6 +60,8 @@ struct SpectrumFrame {
 
 struct SharedSource {
     id: u64,
+    name: Mutex<Option<String>>,
+    name_generation: AtomicU64,
     magnitudes: [AtomicU32; SPECTRUM_BINS],
     sequence: AtomicU64,
     max_frequency: AtomicU32,
@@ -101,6 +103,7 @@ struct GuiState {
     enabled_sources: HashSet<u64>,
     known_sources: HashSet<u64>,
     rendered_sources: HashSet<u64>,
+    source_names: HashMap<u64, (u64, String)>,
     history_generation: u64,
     column_offset: f32,
     last_window_size: (u32, u32),
@@ -119,6 +122,8 @@ impl SharedSource {
     fn new() -> Arc<Self> {
         let source = Arc::new(Self {
             id: NEXT_SOURCE_ID.fetch_add(1, Ordering::Relaxed),
+            name: Mutex::new(None),
+            name_generation: AtomicU64::new(0),
             magnitudes: std::array::from_fn(|_| AtomicU32::new(0.0_f32.to_bits())),
             sequence: AtomicU64::new(0),
             max_frequency: AtomicU32::new(22_050.0_f32.to_bits()),
@@ -144,6 +149,32 @@ impl SharedSource {
             .store(frame.max_frequency.to_bits(), Ordering::Relaxed);
         self.tempo.store(frame.tempo.to_bits(), Ordering::Relaxed);
         self.sequence.store(version, Ordering::Release);
+    }
+
+    fn set_name(&self, name: Option<&str>) {
+        let name = name
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned);
+        let mut current_name = self
+            .name
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if *current_name != name {
+            *current_name = name;
+            self.name_generation.fetch_add(1, Ordering::Release);
+        }
+    }
+
+    fn display_name(&self) -> (u64, String) {
+        let generation = self.name_generation.load(Ordering::Acquire);
+        let name = self
+            .name
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+            .unwrap_or_else(|| format!("Source {}", self.id));
+        (generation, name)
     }
 
     fn snapshot(&self) -> SpectrumFrame {
@@ -327,6 +358,7 @@ impl Default for LiveSpectroVst {
                 enabled_sources: HashSet::new(),
                 known_sources: HashSet::new(),
                 rendered_sources: HashSet::new(),
+                source_names: HashMap::new(),
                 history_generation: u64::MAX,
                 column_offset: 0.0,
                 last_window_size: (WINDOW_WIDTH, WINDOW_HEIGHT),
@@ -452,6 +484,9 @@ impl Plugin for LiveSpectroVst {
                 state
                     .known_sources
                     .retain(|id| live_source_ids.contains(id));
+                state
+                    .source_names
+                    .retain(|id, _| live_source_ids.contains(id));
                 for source in &sources {
                     if state.known_sources.insert(source.id) {
                         state.enabled_sources.insert(source.id);
@@ -563,6 +598,19 @@ impl Plugin for LiveSpectroVst {
                                                         .max_height(ui.available_height())
                                                         .show(ui, |ui| {
                                                             for source in &sources {
+                                                                let generation = source
+                                                                    .name_generation
+                                                                    .load(Ordering::Acquire);
+                                                                let source_name = state
+                                                                    .source_names
+                                                                    .entry(source.id)
+                                                                    .or_insert_with(|| {
+                                                                        source.display_name()
+                                                                    });
+                                                                if source_name.0 != generation {
+                                                                    *source_name =
+                                                                        source.display_name();
+                                                                }
                                                                 ui.horizontal(|ui| {
                                                                     let mut enabled = state
                                                                         .enabled_sources
@@ -571,10 +619,7 @@ impl Plugin for LiveSpectroVst {
                                                                         .checkbox(
                                                                             &mut enabled,
                                                                             egui::RichText::new(
-                                                                                format!(
-                                                                                    "Source {}",
-                                                                                    source.id
-                                                                                ),
+                                                                                &source_name.1,
                                                                             )
                                                                             .color(source_color(
                                                                                 source.id,
@@ -896,6 +941,10 @@ impl ClapPlugin for LiveSpectroVst {
         ClapFeature::Mono,
         ClapFeature::Analyzer,
     ];
+
+    fn track_name_changed(&mut self, track_name: Option<&str>) {
+        self.source.set_name(track_name);
+    }
 }
 
 impl Vst3Plugin for LiveSpectroVst {
@@ -906,6 +955,10 @@ impl Vst3Plugin for LiveSpectroVst {
         Vst3SubCategory::Analyzer,
         Vst3SubCategory::Stereo,
     ];
+
+    fn track_name_changed(&mut self, track_name: Option<&str>) {
+        self.source.set_name(track_name);
+    }
 }
 
 nice_export_clap!(LiveSpectroVst);
@@ -995,5 +1048,18 @@ mod tests {
             SCROLL_LABELS[params.scroll_division.value() as usize],
             "1/32"
         );
+    }
+
+    #[test]
+    fn source_name_falls_back_for_missing_or_blank_metadata() {
+        let source = SharedSource::new();
+        let fallback = format!("Source {}", source.id);
+        assert_eq!(source.display_name().1, fallback);
+
+        source.set_name(Some("  Drums  "));
+        assert_eq!(source.display_name().1, "Drums");
+
+        source.set_name(Some("  "));
+        assert_eq!(source.display_name().1, fallback);
     }
 }

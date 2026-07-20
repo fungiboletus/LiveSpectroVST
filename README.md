@@ -3,6 +3,7 @@
 Live Spectro is a real-time scrolling spectrogram audio effect VST.
 
 ![Screenshot](./screenshot.png)
+![Screenshot Multi](./screenshot2.png)
 
 ## Features
 
@@ -11,10 +12,11 @@ Live Spectro is a real-time scrolling spectrogram audio effect VST.
 - Logarithmic frequency axis.
 - Mono and stereo pass-through processing.
 - VST3 and CLAP exports for macOS, Windows, and Linux
+- If used multiple times, can overlay multiple spectrograms.
 
 ## Vibe Coded
 
-This VST is vibecoded.
+This VST is vibecoded 💩. Enjoy, or not.
 
 ## Download
 

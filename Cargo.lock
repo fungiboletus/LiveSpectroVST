@@ -1356,8 +1356,6 @@ dependencies = [
 [[package]]
 name = "nice-plug"
 version = "0.1.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ddbdac1bfde59a95b9172f72edf664b3c578b7ccfb2eb5447315ebba64455335"
 dependencies = [
  "anyhow",
  "anymap3",
