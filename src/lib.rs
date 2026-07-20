@@ -5,7 +5,7 @@ use nice_plug::prelude::*;
 use nice_plug_egui::{EguiState, create_egui_editor};
 use realfft::num_complex::Complex32;
 use realfft::{RealFftPlanner, RealToComplex};
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Instant;
@@ -20,7 +20,9 @@ const HISTORY_COLUMNS: usize = 600;
 const WINDOW_WIDTH: u32 = 760;
 const WINDOW_HEIGHT: u32 = 480;
 const SOURCE_PANEL_WIDTH: f32 = 138.0;
+const SOURCE_PANEL_PADDING: f32 = 10.0;
 const FREQUENCY_SCALE_WIDTH: f32 = 40.0;
+const SOURCE_ACTIVITY_TIMEOUT_MS: u64 = 1_500;
 
 pub struct LiveSpectroVst {
     params: Arc<LiveSpectroParams>,
@@ -62,20 +64,55 @@ struct SharedSource {
     sequence: AtomicU64,
     max_frequency: AtomicU32,
     tempo: AtomicU32,
+    last_process_ms: AtomicU64,
+}
+
+#[derive(Clone)]
+struct HistorySource {
+    id: u64,
+    magnitudes: [f32; SPECTRUM_BINS],
+}
+
+#[derive(Clone)]
+struct HistoryColumn {
+    sources: Vec<HistorySource>,
+}
+
+struct SharedHistory {
+    columns: VecDeque<HistoryColumn>,
+    generation: u64,
+    column_accumulator: f32,
+    last_update_ms: u64,
 }
 
 static NEXT_SOURCE_ID: AtomicU64 = AtomicU64::new(1);
 static SOURCES: OnceLock<Mutex<Vec<Weak<SharedSource>>>> = OnceLock::new();
+static SHARED_HISTORY: OnceLock<Mutex<SharedHistory>> = OnceLock::new();
 static UI_CLOCK: OnceLock<Instant> = OnceLock::new();
 static UI_HEARTBEAT_MS: AtomicU64 = AtomicU64::new(0);
+static GLOBAL_FFT_SIZE: AtomicU32 = AtomicU32::new(5);
+static GLOBAL_SCROLL_DIVISION: AtomicU32 = AtomicU32::new(5);
+static GLOBAL_WINDOW_SIZE: AtomicU64 =
+    AtomicU64::new(pack_window_size(WINDOW_WIDTH, WINDOW_HEIGHT));
 
 struct GuiState {
     history: ColorImage,
     texture: Option<TextureHandle>,
     enabled_sources: HashSet<u64>,
     known_sources: HashSet<u64>,
-    column_accumulator: f32,
-    last_scroll_update: Instant,
+    rendered_sources: HashSet<u64>,
+    history_generation: u64,
+    column_offset: f32,
+    last_window_size: (u32, u32),
+    pending_window_size: Option<(u32, u32)>,
+}
+
+const fn pack_window_size(width: u32, height: u32) -> u64 {
+    ((width as u64) << 32) | height as u64
+}
+
+fn unpack_window_size(size: u64) -> (u32, u32) {
+    ((size >> 32) as u32, size as u32)
 }
 
 impl SharedSource {
@@ -86,6 +123,7 @@ impl SharedSource {
             sequence: AtomicU64::new(0),
             max_frequency: AtomicU32::new(22_050.0_f32.to_bits()),
             tempo: AtomicU32::new(120.0_f32.to_bits()),
+            last_process_ms: AtomicU64::new(ui_clock_ms()),
         });
         let registry = SOURCES.get_or_init(|| Mutex::new(Vec::new()));
         registry
@@ -136,7 +174,15 @@ fn shared_sources() -> Vec<Arc<SharedSource>> {
     let mut sources = registry
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let live: Vec<_> = sources.iter().filter_map(Weak::upgrade).collect();
+    let now = ui_clock_ms();
+    let live: Vec<_> = sources
+        .iter()
+        .filter_map(Weak::upgrade)
+        .filter(|source| {
+            now.saturating_sub(source.last_process_ms.load(Ordering::Relaxed))
+                < SOURCE_ACTIVITY_TIMEOUT_MS
+        })
+        .collect();
     sources.retain(|source| source.strong_count() > 0);
     live
 }
@@ -147,6 +193,75 @@ fn ui_clock_ms() -> u64 {
 
 fn shared_view_active() -> bool {
     ui_clock_ms().saturating_sub(UI_HEARTBEAT_MS.load(Ordering::Relaxed)) < 500
+}
+
+fn update_shared_history(
+    frames: &[(u64, SpectrumFrame)],
+    seconds_per_pixel: f32,
+    reset: bool,
+) -> (u64, f32) {
+    let history = SHARED_HISTORY.get_or_init(|| {
+        Mutex::new(SharedHistory {
+            columns: VecDeque::with_capacity(HISTORY_COLUMNS),
+            generation: 0,
+            column_accumulator: 0.0,
+            last_update_ms: ui_clock_ms(),
+        })
+    });
+    let mut history = history
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if reset {
+        history.columns.clear();
+        history.column_accumulator = 0.0;
+        history.generation = history.generation.wrapping_add(1);
+        history.last_update_ms = ui_clock_ms();
+    }
+
+    let now = ui_clock_ms();
+    let elapsed = now.saturating_sub(history.last_update_ms).min(100) as f32 / 1_000.0;
+    history.last_update_ms = now;
+    history.column_accumulator += elapsed / seconds_per_pixel;
+    let new_columns = history.column_accumulator.floor() as usize;
+    history.column_accumulator -= new_columns as f32;
+    if new_columns > 0 {
+        let column = HistoryColumn {
+            sources: frames
+                .iter()
+                .map(|(id, frame)| HistorySource {
+                    id: *id,
+                    magnitudes: frame.magnitudes,
+                })
+                .collect(),
+        };
+        for _ in 0..new_columns.min(HISTORY_COLUMNS) {
+            if history.columns.len() == HISTORY_COLUMNS {
+                history.columns.pop_front();
+            }
+            history.columns.push_back(column.clone());
+        }
+        history.generation = history.generation.wrapping_add(1);
+    }
+
+    (history.generation, history.column_accumulator)
+}
+
+fn shared_history_snapshot() -> Vec<HistoryColumn> {
+    SHARED_HISTORY
+        .get_or_init(|| {
+            Mutex::new(SharedHistory {
+                columns: VecDeque::with_capacity(HISTORY_COLUMNS),
+                generation: 0,
+                column_accumulator: 0.0,
+                last_update_ms: ui_clock_ms(),
+            })
+        })
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .columns
+        .iter()
+        .cloned()
+        .collect()
 }
 
 impl Default for SpectrumFrame {
@@ -211,8 +326,11 @@ impl Default for LiveSpectroVst {
                 texture: None,
                 enabled_sources: HashSet::new(),
                 known_sources: HashSet::new(),
-                column_accumulator: 0.0,
-                last_scroll_update: Instant::now(),
+                rendered_sources: HashSet::new(),
+                history_generation: u64::MAX,
+                column_offset: 0.0,
+                last_window_size: (WINDOW_WIDTH, WINDOW_HEIGHT),
+                pending_window_size: None,
             }),
         }
     }
@@ -220,7 +338,7 @@ impl Default for LiveSpectroVst {
 
 impl LiveSpectroVst {
     fn analyze(&mut self, tempo: f32) {
-        let plan_index = self.params.fft_size.value().clamp(0, 5) as usize;
+        let plan_index = GLOBAL_FFT_SIZE.load(Ordering::Relaxed).clamp(0, 5) as usize;
         let fft_size = FFT_SIZES[plan_index];
         let plan = &self.fft_plans[plan_index];
 
@@ -289,20 +407,51 @@ impl Plugin for LiveSpectroVst {
 
     fn editor(&mut self, _async_executor: AsyncExecutor<Self>) -> Option<Box<dyn Editor>> {
         let params = self.params.clone();
+        let editor_state = params.editor_state.clone();
+        editor_state.set_requested_size(unpack_window_size(
+            GLOBAL_WINDOW_SIZE.load(Ordering::Relaxed),
+        ));
         let gui_state = self.initial_gui_state.take().unwrap();
 
         create_egui_editor(
-            params.editor_state.clone(),
+            editor_state,
             gui_state,
             Default::default(),
             |_ctx, _queue, state| {
                 // Texture IDs belong to one renderer and become invalid when a host closes the UI.
                 state.texture = None;
-                state.last_scroll_update = Instant::now();
             },
             move |ui, setter, _queue, state| {
-                UI_HEARTBEAT_MS.store(ui_clock_ms(), Ordering::Relaxed);
+                let current_window_size = params.editor_state.size();
+                if state.pending_window_size == Some(current_window_size) {
+                    state.pending_window_size = None;
+                } else if current_window_size != state.last_window_size {
+                    GLOBAL_WINDOW_SIZE.store(
+                        pack_window_size(current_window_size.0, current_window_size.1),
+                        Ordering::Relaxed,
+                    );
+                }
+                let global_window_size =
+                    unpack_window_size(GLOBAL_WINDOW_SIZE.load(Ordering::Relaxed));
+                if current_window_size != global_window_size
+                    && state.pending_window_size != Some(global_window_size)
+                {
+                    params.editor_state.set_requested_size(global_window_size);
+                    state.pending_window_size = Some(global_window_size);
+                }
+                state.last_window_size = current_window_size;
+
+                let now = ui_clock_ms();
+                let start_new_session =
+                    now.saturating_sub(UI_HEARTBEAT_MS.swap(now, Ordering::Relaxed)) >= 500;
                 let sources = shared_sources();
+                let live_source_ids: HashSet<_> = sources.iter().map(|source| source.id).collect();
+                state
+                    .enabled_sources
+                    .retain(|id| live_source_ids.contains(id));
+                state
+                    .known_sources
+                    .retain(|id| live_source_ids.contains(id));
                 for source in &sources {
                     if state.known_sources.insert(source.id) {
                         state.enabled_sources.insert(source.id);
@@ -310,7 +459,6 @@ impl Plugin for LiveSpectroVst {
                 }
                 let frames: Vec<_> = sources
                     .iter()
-                    .filter(|source| state.enabled_sources.contains(&source.id))
                     .map(|source| (source.id, source.snapshot()))
                     .collect();
                 let tempo = frames
@@ -322,19 +470,21 @@ impl Plugin for LiveSpectroVst {
                     .iter()
                     .map(|(_, frame)| frame.max_frequency)
                     .fold(22_050.0_f32, f32::max);
-                let elapsed = state.last_scroll_update.elapsed().as_secs_f32().min(0.1);
-                state.last_scroll_update = Instant::now();
-                let division = params.scroll_division.value().clamp(0, 6) as usize;
+                let division = GLOBAL_SCROLL_DIVISION.load(Ordering::Relaxed).clamp(0, 6) as usize;
                 let seconds_per_pixel = SCROLL_BEATS_PER_PIXEL[division] * 60.0 / tempo;
-                state.column_accumulator += elapsed / seconds_per_pixel;
-                let columns = state.column_accumulator.floor() as usize;
-                state.column_accumulator -= columns as f32;
-                if columns > 0 {
-                    append_shared_spectrum_columns(
+                let (history_generation, column_offset) =
+                    update_shared_history(&frames, seconds_per_pixel, start_new_session);
+                state.column_offset = column_offset;
+                if history_generation != state.history_generation
+                    || state.enabled_sources != state.rendered_sources
+                {
+                    render_shared_history(
                         &mut state.history,
-                        &frames,
-                        columns.min(HISTORY_COLUMNS),
+                        &shared_history_snapshot(),
+                        &state.enabled_sources,
                     );
+                    state.history_generation = history_generation;
+                    state.rendered_sources.clone_from(&state.enabled_sources);
                     if let Some(texture) = &mut state.texture {
                         texture.set(state.history.clone(), TextureOptions::LINEAR);
                     }
@@ -353,8 +503,10 @@ impl Plugin for LiveSpectroVst {
                                     .color(Color32::from_rgb(143, 163, 190)),
                             );
                             for (index, size) in FFT_SIZES.iter().enumerate() {
-                                let selected = params.fft_size.value() == index as i32;
+                                let selected =
+                                    GLOBAL_FFT_SIZE.load(Ordering::Relaxed) == index as u32;
                                 if ui.selectable_label(selected, size.to_string()).clicked() {
+                                    GLOBAL_FFT_SIZE.store(index as u32, Ordering::Relaxed);
                                     setter.begin_set_parameter(&params.fft_size);
                                     setter.set_parameter(&params.fft_size, index as i32);
                                     setter.end_set_parameter(&params.fft_size);
@@ -368,8 +520,10 @@ impl Plugin for LiveSpectroVst {
                             );
                             for index in SCROLL_DISPLAY_ORDER {
                                 let label = SCROLL_LABELS[index];
-                                let selected = params.scroll_division.value() == index as i32;
+                                let selected =
+                                    GLOBAL_SCROLL_DIVISION.load(Ordering::Relaxed) == index as u32;
                                 if ui.selectable_label(selected, label).clicked() {
+                                    GLOBAL_SCROLL_DIVISION.store(index as u32, Ordering::Relaxed);
                                     setter.begin_set_parameter(&params.scroll_division);
                                     setter.set_parameter(&params.scroll_division, index as i32);
                                     setter.end_set_parameter(&params.scroll_division);
@@ -386,47 +540,63 @@ impl Plugin for LiveSpectroVst {
                                 if sources.len() > 1 {
                                     ui.allocate_ui_with_layout(
                                         Vec2::new(SOURCE_PANEL_WIDTH, content_size.y),
-                                        egui::Layout::top_down(egui::Align::Min),
+                                        egui::Layout::left_to_right(egui::Align::Min),
                                         |ui| {
-                                            ui.add_space(4.0);
-                                            ui.label(
-                                                egui::RichText::new("SOURCES")
-                                                    .strong()
-                                                    .color(Color32::from_rgb(143, 163, 190)),
-                                            );
-                                            ui.add_space(4.0);
-                                            egui::ScrollArea::vertical()
-                                                .id_salt("source-list")
-                                                .show(ui, |ui| {
-                                                    for source in &sources {
-                                                        ui.horizontal(|ui| {
-                                                            let mut enabled = state
-                                                                .enabled_sources
-                                                                .contains(&source.id);
-                                                            if ui
-                                                                .checkbox(
-                                                                    &mut enabled,
-                                                                    egui::RichText::new(format!(
-                                                                        "Source {}",
-                                                                        source.id
-                                                                    ))
-                                                                    .color(source_color(source.id)),
-                                                                )
-                                                                .changed()
-                                                            {
-                                                                if enabled {
-                                                                    state
+                                            ui.add_space(SOURCE_PANEL_PADDING);
+                                            ui.allocate_ui_with_layout(
+                                                Vec2::new(
+                                                    SOURCE_PANEL_WIDTH - SOURCE_PANEL_PADDING,
+                                                    content_size.y,
+                                                ),
+                                                egui::Layout::top_down(egui::Align::Min),
+                                                |ui| {
+                                                    ui.label(
+                                                        egui::RichText::new("SOURCES")
+                                                            .strong()
+                                                            .color(Color32::from_rgb(
+                                                                143, 163, 190,
+                                                            )),
+                                                    );
+                                                    ui.add_space(4.0);
+                                                    egui::ScrollArea::vertical()
+                                                        .id_salt("source-list")
+                                                        .max_height(ui.available_height())
+                                                        .show(ui, |ui| {
+                                                            for source in &sources {
+                                                                ui.horizontal(|ui| {
+                                                                    let mut enabled = state
                                                                         .enabled_sources
-                                                                        .insert(source.id);
-                                                                } else {
-                                                                    state
-                                                                        .enabled_sources
-                                                                        .remove(&source.id);
-                                                                }
+                                                                        .contains(&source.id);
+                                                                    if ui
+                                                                        .checkbox(
+                                                                            &mut enabled,
+                                                                            egui::RichText::new(
+                                                                                format!(
+                                                                                    "Source {}",
+                                                                                    source.id
+                                                                                ),
+                                                                            )
+                                                                            .color(source_color(
+                                                                                source.id,
+                                                                            )),
+                                                                        )
+                                                                        .changed()
+                                                                    {
+                                                                        if enabled {
+                                                                            state
+                                                                                .enabled_sources
+                                                                                .insert(source.id);
+                                                                        } else {
+                                                                            state
+                                                                                .enabled_sources
+                                                                                .remove(&source.id);
+                                                                        }
+                                                                    }
+                                                                });
                                                             }
                                                         });
-                                                    }
-                                                });
+                                                },
+                                            );
                                         },
                                     );
                                 }
@@ -448,12 +618,11 @@ impl Plugin for LiveSpectroVst {
                                         .bg_fill(Color32::from_rgb(5, 8, 14))
                                         .uv(egui::Rect::from_min_max(
                                             egui::pos2(
-                                                state.column_accumulator / HISTORY_COLUMNS as f32,
+                                                state.column_offset / HISTORY_COLUMNS as f32,
                                                 0.0,
                                             ),
                                             egui::pos2(
-                                                1.0 + state.column_accumulator
-                                                    / HISTORY_COLUMNS as f32,
+                                                1.0 + state.column_offset / HISTORY_COLUMNS as f32,
                                                 1.0,
                                             ),
                                         )),
@@ -489,6 +658,9 @@ impl Plugin for LiveSpectroVst {
         _aux: &mut AuxiliaryBuffers,
         context: &mut impl ProcessContext<Self>,
     ) -> ProcessStatus {
+        self.source
+            .last_process_ms
+            .store(ui_clock_ms(), Ordering::Relaxed);
         if !self.params.editor_state.is_open() && !shared_view_active() {
             return ProcessStatus::Normal;
         }
@@ -515,45 +687,93 @@ impl Plugin for LiveSpectroVst {
     }
 }
 
-fn append_shared_spectrum_columns(
+fn render_shared_history(
     image: &mut ColorImage,
-    frames: &[(u64, SpectrumFrame)],
-    columns: usize,
+    history: &[HistoryColumn],
+    enabled_sources: &HashSet<u64>,
 ) {
-    let width = image.size[0];
-    for row in 0..image.size[1] {
-        let row_start = row * width;
-        image
-            .pixels
-            .copy_within(row_start + columns..row_start + width, row_start);
-        let bin = SPECTRUM_BINS - 1 - row;
-        let color = mixed_spectrum_color(
-            frames
-                .iter()
-                .map(|(id, frame)| (source_hue(*id), frame.magnitudes[bin])),
-        );
-        image.pixels[row_start + width - columns..row_start + width].fill(color);
+    image.pixels.fill(Color32::from_rgb(5, 8, 14));
+    let first_column = HISTORY_COLUMNS.saturating_sub(history.len());
+    for (history_index, column) in history.iter().enumerate() {
+        let x = first_column + history_index;
+        for row in 0..SPECTRUM_BINS {
+            let bin = SPECTRUM_BINS - 1 - row;
+            image.pixels[row * HISTORY_COLUMNS + x] = mixed_spectrum_color(
+                column
+                    .sources
+                    .iter()
+                    .filter(|source| enabled_sources.contains(&source.id))
+                    .map(|source| (source_hue(source.id), source.magnitudes[bin])),
+            );
+        }
     }
 }
 
 fn source_hue(id: u64) -> f32 {
-    (id.saturating_sub(1) as f32 * 137.507_77) % 360.0
+    if let Some([red, green, blue]) = dark2_color(id) {
+        return srgb_to_oklch_hue(red, green, blue);
+    }
+
+    (id.saturating_sub(9) as f32 * 137.507_77 + 30.0) % 360.0
 }
 
 fn source_color(id: u64) -> Color32 {
-    oklch_to_color32(0.72, 0.16, source_hue(id))
+    if let Some([red, green, blue]) = dark2_color(id) {
+        Color32::from_rgb(red, green, blue)
+    } else {
+        oklch_to_color32(0.72, 0.16, source_hue(id))
+    }
 }
 
-fn mixed_spectrum_color(mut sources: impl ExactSizeIterator<Item = (f32, f32)>) -> Color32 {
-    if sources.len() == 1 {
-        return viridis_color(sources.next().unwrap().1);
-    }
+fn dark2_color(id: u64) -> Option<[u8; 3]> {
+    const DARK2: [[u8; 3]; 8] = [
+        [0x1B, 0x9E, 0x77],
+        [0xD9, 0x5F, 0x02],
+        [0x75, 0x70, 0xB3],
+        [0xE7, 0x29, 0x8A],
+        [0x66, 0xA6, 0x1E],
+        [0xE6, 0xAB, 0x02],
+        [0xA6, 0x76, 0x1D],
+        [0x66, 0x66, 0x66],
+    ];
+    DARK2.get(id.checked_sub(1)? as usize).copied()
+}
 
+fn srgb_to_oklch_hue(red: u8, green: u8, blue: u8) -> f32 {
+    let to_linear = |channel: u8| {
+        let value = channel as f32 / 255.0;
+        if value <= 0.040_45 {
+            value / 12.92
+        } else {
+            ((value + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    let red = to_linear(red);
+    let green = to_linear(green);
+    let blue = to_linear(blue);
+    let l = 0.412_221_46 * red + 0.536_332_55 * green + 0.051_445_995 * blue;
+    let m = 0.211_903_5 * red + 0.680_699_5 * green + 0.107_396_96 * blue;
+    let s = 0.088_302_46 * red + 0.281_718_85 * green + 0.629_978_7 * blue;
+    let l_ = l.cbrt();
+    let m_ = m.cbrt();
+    let s_ = s.cbrt();
+    let a = 1.977_998_5 * l_ - 2.428_592_2 * m_ + 0.450_593_7 * s_;
+    let b = 0.025_904_037 * l_ + 0.782_771_77 * m_ - 0.808_675_77 * s_;
+    b.atan2(a).to_degrees().rem_euclid(360.0)
+}
+
+fn mixed_spectrum_color(mut sources: impl Iterator<Item = (f32, f32)>) -> Color32 {
+    let Some(first) = sources.next() else {
+        return Color32::from_rgb(5, 8, 14);
+    };
+    let Some(second) = sources.next() else {
+        return viridis_color(first.1);
+    };
     let mut total_energy = 0.0;
     let mut hue_x = 0.0;
     let mut hue_y = 0.0;
     let mut strongest = 0.0_f32;
-    for (hue, magnitude) in sources {
+    for (hue, magnitude) in [first, second].into_iter().chain(sources) {
         let energy = magnitude.clamp(0.0, 1.0).powi(2);
         let radians = hue.to_radians();
         total_energy += energy;
@@ -696,18 +916,39 @@ mod tests {
     use super::*;
 
     #[test]
-    fn appending_spectrum_scrolls_left() {
-        let mut image = ColorImage::filled([4, SPECTRUM_BINS], Color32::BLACK);
-        let mut frame = SpectrumFrame::default();
-        frame.magnitudes[0] = 1.0;
+    fn shared_history_is_right_aligned() {
+        let mut image = ColorImage::filled([HISTORY_COLUMNS, SPECTRUM_BINS], Color32::BLACK);
+        let mut magnitudes = [0.0; SPECTRUM_BINS];
+        magnitudes[0] = 1.0;
+        let history = [HistoryColumn {
+            sources: vec![HistorySource { id: 1, magnitudes }],
+        }];
 
-        append_shared_spectrum_columns(&mut image, &[(1, frame)], 1);
+        render_shared_history(&mut image, &history, &HashSet::from([1]));
 
         assert_eq!(
-            image.pixels[(SPECTRUM_BINS - 1) * 4 + 3],
+            image.pixels[SPECTRUM_BINS * HISTORY_COLUMNS - 1],
             viridis_color(1.0)
         );
-        assert_eq!(image.pixels[3], viridis_color(0.0));
+        assert_eq!(image.pixels[0], Color32::from_rgb(5, 8, 14));
+    }
+
+    #[test]
+    fn shared_history_respects_source_selection() {
+        let mut image = ColorImage::filled([HISTORY_COLUMNS, SPECTRUM_BINS], Color32::BLACK);
+        let history = [HistoryColumn {
+            sources: vec![HistorySource {
+                id: 1,
+                magnitudes: [1.0; SPECTRUM_BINS],
+            }],
+        }];
+
+        render_shared_history(&mut image, &history, &HashSet::new());
+
+        assert_eq!(
+            image.pixels[HISTORY_COLUMNS - 1],
+            Color32::from_rgb(5, 8, 14)
+        );
     }
 
     #[test]
@@ -720,6 +961,13 @@ mod tests {
             mixed_spectrum_color([(source_hue(3), 1.0)].into_iter()),
             Color32::from_rgb(253, 231, 37)
         );
+    }
+
+    #[test]
+    fn first_sources_use_dark2() {
+        assert_eq!(source_color(1), Color32::from_rgb(0x1B, 0x9E, 0x77));
+        assert_eq!(source_color(8), Color32::from_rgb(0x66, 0x66, 0x66));
+        assert!(dark2_color(9).is_none());
     }
 
     #[test]
