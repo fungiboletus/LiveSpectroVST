@@ -1,0 +1,31 @@
+[workspace]
+members = ["xtask"]
+resolver = "3"
+
+[package]
+name = "live-spectro-vst"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+license = "WTFPL"
+description = "A tempo-synced scrolling spectrogram audio plugin"
+repository = "https://github.com/fungiboletus/LiveSpectroVST"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+egui = { version = "0.35.0", features = ["default_fonts"] }
+nice-plug = { version = "=0.1.9", features = ["assert_process_allocs"] }
+nice-plug-egui = { path = "vendor/nice-plug-egui" }
+realfft = "3.5.0"
+triple_buffer = "9.0.0"
+
+[patch.crates-io]
+baseview = { path = "vendor/baseview" }
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+strip = "symbols"
